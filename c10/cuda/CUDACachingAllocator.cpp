@@ -1401,7 +1401,7 @@ class DeviceCachingAllocator {
             // over-subscription before doing the "hard" reclaimation.
             reserved_bytes > allocated_bytes * 4 / 3 &&
             C10_LIKELY(captures_underway == 0)) {
-          release_cached_blocks();
+          garbage_collect_cached_blocks();
         }
       }
 
