@@ -20,6 +20,7 @@
 #include <torch/csrc/jit/runtime/instruction.h>
 #include <c10/util/Flags.h>
 
+#include <iostream>
 #include <fstream>
 
 namespace torch {
