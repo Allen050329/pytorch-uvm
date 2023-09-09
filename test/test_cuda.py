@@ -3076,7 +3076,11 @@ exit(2)
         ] + [
             (optimizer_ctor, {"lr": 0.1, "betas": (0.8, 0.7), "fused": True, "amsgrad": amsgrad})
             for optimizer_ctor, amsgrad in product((torch.optim.Adam, torch.optim.AdamW), (False, True))
+        ] + [
+            (torch.optim.ASGD, {"lr": 0.1, "foreach": True, "maximize": maximize, "weight_decay": weight_decay})
+            for maximize, weight_decay in product((False, True), (0.0, 0.1))
         ]
+
 
         for optimizer_ctor, kwargs in cases:
             with self.subTest(optimizer_ctor=optimizer_ctor, kwargs=kwargs):
@@ -3635,6 +3639,13 @@ class TestCudaMallocAsync(TestCase):
             # not supported with the cudaMallocAsync backend
             self.assertTrue(pow2_div2_mem - start_mem == power2_div(nbytes_big, 2))
 
+        torch.cuda.memory.empty_cache()
+        torch.cuda.memory._set_allocator_settings("release_lock_on_cudamalloc:True")
+        start_mem = torch.cuda.memory_stats()[key_allocated]
+        w = torch.rand(nelems, device='cuda')
+        reg_mem = torch.cuda.memory_stats()[key_allocated]
+        self.assertTrue(reg_mem - start_mem == nbytes)
+
         with self.assertRaises(RuntimeError):
             torch.cuda.memory._set_allocator_settings("foo:1,bar:2")
 
@@ -3643,6 +3654,9 @@ class TestCudaMallocAsync(TestCase):
 
         with self.assertRaises(RuntimeError):
             torch.cuda.memory._set_allocator_settings("max_split_size_mb:2")
+
+        with self.assertRaises(RuntimeError):
+            torch.cuda.memory._set_allocator_settings("release_lock_on_cudamalloc:none")
 
 
     @unittest.skipIf(TEST_CUDA_UVM, "It's hard to trigger OOM with UVM enabled")
