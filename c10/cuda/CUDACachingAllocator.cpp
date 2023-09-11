@@ -2736,20 +2736,6 @@ class DeviceCachingAllocator {
       }
       return bool(p.block);
     } else {
-      if (CachingAllocatorConfig::release_lock_on_cudamalloc()) {
-        // At scope exit, acquire the lock again. This provides safety against
-        // any potential exceptions in the cudaMallocMaybeCapturing function.
-        auto sg = c10::make_scope_exit([&]() { lock.lock(); });
-        lock.unlock();
-        p.err = cudaMallocMaybeCapturing(&ptr, size);
-      } else {
-        p.err = cudaMallocMaybeCapturing(&ptr, size);
-      }
-      if (CachingAllocatorConfig::release_lock_on_cudamalloc()) {
-        TORCH_CHECK(
-            lock.owns_lock(), "Failed to acquire lock after cudaMalloc");
-      }
-
       if (p.err != cudaSuccess) {
         if (p.err == cudaErrorMemoryAllocation) {
           // If this is the first attempt (!isRetry), we can forgive and clear
