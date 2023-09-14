@@ -3377,7 +3377,7 @@ class NativeCachingAllocator : public CUDAAllocator {
 
       // Deliberately don't use cudaMallocMaybeCapturing here, to force an error
       // if someone tries to use forceUncachedAllocator while capturing.
-      C10_CUDA_CHECK(cudaMallocMaybeUsingUvm(&r, size));
+      C10_CUDA_CHECK(cudaMallocMaybeUsingUvm(&devPtr, size));
       const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
       if (C10_UNLIKELY(interp)) {
         (*interp)->trace_gpu_memory_allocation(
