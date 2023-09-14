@@ -27,7 +27,7 @@ from torch.testing._internal.common_device_type import \
      toleranceOverride, tol)
 from torch.testing._internal.common_cuda import (
     SM53OrLater, SM60OrLater, SM80OrLater, with_tf32_off, TEST_CUDNN,
-    _get_torch_cuda_version, _get_torch_rocm_version, PLATFORM_SUPPORTS_FUSED_SDPA
+    _get_torch_cuda_version, _get_torch_rocm_version, PLATFORM_SUPPORTS_FUSED_ATTENTION,
 )
 from torch.testing._internal.common_utils import (
     make_fullrank_matrices_with_distinct_singular_values,
@@ -2465,7 +2465,7 @@ def reference_unbind(t, dim):
     """A numpy implementation of torch.unbind"""
     return tuple(s.squeeze(dim) for s in np.split(t, t.shape[dim], dim))
 
-def sample_inputs_gather(op_info, device, dtype, requires_grad, include_0d=True, **kwargs):
+def sample_inputs_gather(op_info, device, dtype, requires_grad, **kwargs):
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     yield SampleInput(
         make_arg((M, S)),
@@ -2481,15 +2481,14 @@ def sample_inputs_gather(op_info, device, dtype, requires_grad, include_0d=True,
         0,
         torch.tensor([], dtype=torch.uint8, device=device))
     # 0D tensor case
-    if include_0d:
-        yield SampleInput(
-            make_arg(()),
-            0,
-            torch.tensor([0], dtype=torch.int64, device=device))
-        yield SampleInput(
-            make_arg(()),
-            0,
-            torch.tensor(0, dtype=torch.int64, device=device))
+    yield SampleInput(
+        make_arg(()),
+        0,
+        torch.tensor([0], dtype=torch.int64, device=device))
+    yield SampleInput(
+        make_arg(()),
+        0,
+        torch.tensor(0, dtype=torch.int64, device=device))
 
 def _fill_indices(idx, dim, dim_size, elems_per_row, m, n, o):
     for i in range(1 if dim == 0 else m):
@@ -2840,8 +2839,6 @@ def sample_inputs_take_along_dim(op_info, device, dtype, requires_grad, **kwargs
         make_arg((1, S)), gather_variable((S, S // 2), 0, S, True, device=device), 1)
 
     # without `dim` arg
-    yield SampleInput(
-        make_arg((S, S)), gather_variable((S, S // 2), 0, S, True, device=device))
     yield SampleInput(
         make_arg((S, S)), gather_variable((S, S // 2), 0, S, True, device=device))
 
@@ -12302,8 +12299,7 @@ op_db: List[OpInfo] = [
            )),
     OpInfo('native_batch_norm',
            aten_name='native_batch_norm',
-           dtypes=floating_types_and(torch.bfloat16),
-           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.float16, torch.bfloat16),
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
            assert_jit_shape_analysis=True,
@@ -12333,8 +12329,7 @@ op_db: List[OpInfo] = [
            ),
     OpInfo('_native_batch_norm_legit',
            aten_name='_native_batch_norm_legit',
-           dtypes=floating_types_and(torch.bfloat16),
-           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.float16, torch.bfloat16),
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
            assert_jit_shape_analysis=True,
@@ -12787,8 +12782,7 @@ op_db: List[OpInfo] = [
            supports_expanded_weight=True,),
     OpInfo('nn.functional.instance_norm',
            # no ref because instance_norm will often have numerical instability (large numbers or nan)
-           dtypes=floating_types_and(torch.bfloat16),
-           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.float16, torch.bfloat16),
            supports_out=False,
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
@@ -13649,9 +13643,9 @@ op_db: List[OpInfo] = [
             DecorateInfo(unittest.skip("Skipped!"), 'TestNormalizeOperators', 'test_normalize_operator_exhaustive'),
             # See [Note] SDPA returns Philox Offset and Seed as tensors that will live on CPU when not in cuda graph capture
             DecorateInfo(unittest.expectedFailure, 'TestFakeTensor', 'test_fake_crossref_backward_amp',
-                         device_type='cuda', dtypes=(torch.float32,), active_if=PLATFORM_SUPPORTS_FUSED_SDPA),
+                         device_type='cuda', dtypes=(torch.float32,), active_if=PLATFORM_SUPPORTS_FUSED_ATTENTION),
             DecorateInfo(unittest.expectedFailure, 'TestFakeTensor', 'test_fake_crossref_backward_no_amp',
-                         device_type='cuda', dtypes=(torch.float32,), active_if=PLATFORM_SUPPORTS_FUSED_SDPA),
+                         device_type='cuda', dtypes=(torch.float32,), active_if=PLATFORM_SUPPORTS_FUSED_ATTENTION),
             # TODO Need to understand what this is testing and why it doesn't work
             DecorateInfo(unittest.skip("Skipped"), 'TestDecomp', 'test_comprehensive'),
             DecorateInfo(unittest.skip('output is non-deterministic (when dropout_p > 0)'), 'TestCommon', 'test_compare_cpu'),
@@ -13953,8 +13947,7 @@ op_db: List[OpInfo] = [
     # See https://github.com/pytorch/pytorch/pull/63218#discussion_r688549391 for more details
     OpInfo('nn.functional.batch_norm',
            aten_name='batch_norm',
-           dtypes=floating_types_and(torch.bfloat16),
-           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.float16, torch.bfloat16),
            supports_out=False,
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
@@ -13964,7 +13957,7 @@ op_db: List[OpInfo] = [
                # see https://github.com/pytorch/pytorch/issues/71286
                DecorateInfo(unittest.expectedFailure, 'TestNNCOpInfo', 'test_nnc_correctness'),
                DecorateInfo(unittest.skip('Skipped!'), 'TestNNCOpInfo', 'test_nnc_correctness',
-                            device_type='cpu', dtypes=(torch.bfloat16,)),
+                            device_type='cpu', dtypes=(torch.bfloat16, torch.float16)),
                # Trying to use forward AD with miopen_batch_norm that does not support it
                # because it has not been implemented yet.
                DecorateInfo(unittest.expectedFailure, 'TestCompositeCompliance', 'test_forward_ad',
