@@ -4274,6 +4274,7 @@ def sample_inputs_interpolate(mode, self, device, dtype, requires_grad, **kwargs
         align_corners_options = (True, False, None)
     ranks_for_mode = {
         'nearest': [1, 2, 3],
+        'nearest-exact': [1, 2, 3],
         'linear': [1],
         'bilinear': [2],
         'bicubic': [2],
@@ -7287,6 +7288,69 @@ def sample_inputs_dropout_backward(op_info, device, dtype, requires_grad, **kwar
     for case, scale in product(cases, scale_vals):
         yield SampleInput(make_arg(case), make_mask(case), scale)
 
+def sample_inputs_embedding_bag_dense_backward(op_info, device, dtype, requires_grad, **kwargs):
+    for sample in sample_inputs_embedding_bag(op_info, device, dtype, requires_grad, **kwargs):
+        weight = sample.input  # NB: is flipped with indices!
+        assert len(sample.args) == 1
+        indices = sample.args[0]
+        offsets = sample.kwargs.pop('offsets', None)
+        per_sample_weights = sample.kwargs.pop('per_sample_weights', None)
+        # Some of the logic here is cribbed from torch.nn.functional.embedding_bag
+        if offsets is None:
+            offsets = torch.arange(0, indices.numel(), indices.size(1), dtype=indices.dtype, device=indices.device)
+            indices = indices.reshape(-1)
+            if per_sample_weights is not None:
+                per_sample_weights = per_sample_weights.reshape(-1)
+        num_weights = weight.size(0)
+        scale_grad_by_freq = sample.kwargs.pop('scale_grad_by_freq', False)
+        mode = sample.kwargs.pop('mode', 'mean')
+        if mode == "sum":
+            mode_enum = 0
+        elif mode == "mean":
+            mode_enum = 1
+        elif mode == "max":
+            mode_enum = 2
+        padding_idx = sample.kwargs.pop('padding_idx', None)
+        include_last_offset = sample.kwargs.pop('include_last_offset', False)
+
+        if padding_idx is None:
+            padding_idx = -1
+        else:
+            from torch._meta_registrations import maybe_wrap_dim
+            padding_idx = maybe_wrap_dim(padding_idx, weight.size(0))
+
+        sample.kwargs.pop('max_norm', None)  # not used by the op
+        sample.kwargs.pop('norm_type', None)  # not used by the op
+
+        # This is a precondition for the function, so force it
+        indices = indices.contiguous()
+        offsets = offsets.contiguous()
+
+        if sample.kwargs.pop('sparse', False):
+            # don't do sparse samples
+            continue
+
+        assert not sample.kwargs, sample.kwargs
+
+        # Run the internal op to compute maximum_indices/offset2bag/etc
+        # sparse=False.  Force grad enabled to ensure the gradient stuff
+        # gets allocated.
+        weight.requires_grad = True
+        with torch.enable_grad():
+            output, offset2bag, bag_size, maximum_indices = torch.ops.aten.embedding_bag.padding_idx(
+                weight, indices, offsets, scale_grad_by_freq, mode_enum, False, per_sample_weights, include_last_offset, padding_idx
+            )
+
+        grad = torch.randn_like(output)
+
+        yield SampleInput(
+            grad,
+            args=(
+                indices, offset2bag, bag_size, maximum_indices, num_weights, scale_grad_by_freq,
+                mode_enum, per_sample_weights, padding_idx
+            ),
+        )
+
 def sample_inputs_embedding_bag(op_info, device, dtype, requires_grad, **kwargs):
     def make_input(shape):
         return make_tensor(shape, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -8119,7 +8183,10 @@ def sample_inputs_pixel_unshuffle(op_info, device, dtype, requires_grad, **kwarg
 
 def sample_inputs_binary_cross_entropy(op_info, device, dtype, requires_grad, logits=False, **kwargs):
     make = partial(make_tensor, device=device, dtype=dtype)
-    make_prob = partial(make, low=0, high=1)
+    # Lower bounds must be greater than 'eps' defined in gradcheck.py::gradgradcheck() -> eps
+    # otherwise perturbation calculation causes Tensor value to become negative triggering
+    # a device-side hardware assertion
+    make_prob = partial(make, low=1e-6, high=1)
 
     reductions = ("mean", "sum", "none")
 
@@ -12299,7 +12366,8 @@ op_db: List[OpInfo] = [
            )),
     OpInfo('native_batch_norm',
            aten_name='native_batch_norm',
-           dtypes=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.bfloat16),
+           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
            assert_jit_shape_analysis=True,
@@ -12329,7 +12397,8 @@ op_db: List[OpInfo] = [
            ),
     OpInfo('_native_batch_norm_legit',
            aten_name='_native_batch_norm_legit',
-           dtypes=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.bfloat16),
+           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
            assert_jit_shape_analysis=True,
@@ -12782,7 +12851,8 @@ op_db: List[OpInfo] = [
            supports_expanded_weight=True,),
     OpInfo('nn.functional.instance_norm',
            # no ref because instance_norm will often have numerical instability (large numbers or nan)
-           dtypes=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.bfloat16),
+           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
            supports_out=False,
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
@@ -12944,6 +13014,34 @@ op_db: List[OpInfo] = [
                # INTERNAL ASSERT FAILED at "../torch/csrc/jit/passes/utils/check_alias_annotation.cpp":185,
                # please report a bug to PyTorch.
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),
+           ),
+           supports_out=False),
+    OpInfo('nn.functional.interpolate',
+           aten_name="interpolate",
+           variant_test_name='nearest-exact',
+           supports_autograd=True,
+           supports_fwgrad_bwgrad=True,
+           supports_forward_ad=True,
+           dtypes=floating_types_and(torch.uint8),
+           dtypesIfCUDA=floating_types_and(torch.half, torch.bfloat16, torch.uint8),
+           sample_inputs_func=partial(sample_inputs_interpolate, 'nearest-exact'),
+           skips=(
+               # RuntimeError: false
+               # INTERNAL ASSERT FAILED at "../torch/csrc/jit/passes/utils/check_alias_annotation.cpp":185,
+               # please report a bug to PyTorch.
+               DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),
+               # RuntimeError: aten::_upsample_nearest_exact*d hit the vmap fallback which is currently disabled
+               DecorateInfo(unittest.expectedFailure, 'TestOperators', 'test_vmapjvpall_has_batch_rule'),
+               DecorateInfo(unittest.expectedFailure, 'TestOperators', 'test_vmapvjp_has_batch_rule'),
+               DecorateInfo(unittest.expectedFailure, 'TestVmapOperatorsOpInfo', 'test_op_has_batch_rule'),
+               # MissingOperatorWithoutDecomp: missing lowering
+               DecorateInfo(unittest.expectedFailure, 'TestInductorOpInfo', 'test_comprehensive'),
+               # RuntimeError: Cannot call sizes() on tensor with symbolic sizes/strides
+               DecorateInfo(unittest.expectedFailure, 'TestProxyTensorOpInfo', 'test_make_fx_symbolic_exhaustive'),
+               DecorateInfo(unittest.expectedFailure, 'TestEagerFusionOpInfo', 'test_aot_autograd_symbolic_exhaustive'),
+               # NotImplementedError: The operator 'aten::_upsample_nearest_exact3d.out' is not currently implemented
+               # for the MPS device.
+               DecorateInfo(unittest.expectedFailure, 'TestConsistency'),
            ),
            supports_out=False),
     OpInfo('nn.functional.interpolate',
@@ -13947,7 +14045,8 @@ op_db: List[OpInfo] = [
     # See https://github.com/pytorch/pytorch/pull/63218#discussion_r688549391 for more details
     OpInfo('nn.functional.batch_norm',
            aten_name='batch_norm',
-           dtypes=floating_types_and(torch.float16, torch.bfloat16),
+           dtypes=floating_types_and(torch.bfloat16),
+           dtypesIfCUDA=floating_types_and(torch.float16, torch.bfloat16),
            supports_out=False,
            supports_forward_ad=True,
            supports_fwgrad_bwgrad=True,
@@ -13957,7 +14056,7 @@ op_db: List[OpInfo] = [
                # see https://github.com/pytorch/pytorch/issues/71286
                DecorateInfo(unittest.expectedFailure, 'TestNNCOpInfo', 'test_nnc_correctness'),
                DecorateInfo(unittest.skip('Skipped!'), 'TestNNCOpInfo', 'test_nnc_correctness',
-                            device_type='cpu', dtypes=(torch.bfloat16, torch.float16)),
+                            device_type='cpu', dtypes=(torch.bfloat16,)),
                # Trying to use forward AD with miopen_batch_norm that does not support it
                # because it has not been implemented yet.
                DecorateInfo(unittest.expectedFailure, 'TestCompositeCompliance', 'test_forward_ad',
@@ -14011,15 +14110,6 @@ op_db: List[OpInfo] = [
                 toleranceOverride({torch.float32: tol(atol=1e-3, rtol=1e-3)}),
                 "TestJit",
                 "test_variant_consistency_jit",
-            ),
-            # https://github.com/pytorch/pytorch/issues/98431
-            # ROCM fails with Device-side assertion `target_val >= zero && target_val <= one' failed
-            # even though sample inputs for target are generated with low=0 and high=1
-            DecorateInfo(
-                unittest.skip("Skipped!"),
-                "TestFwdGradients",
-                "test_fn_fwgrad_bwgrad",
-                active_if=TEST_WITH_ROCM,
             ),
             DecorateInfo(
                 unittest.skip("Skipped!"),
@@ -17763,6 +17853,27 @@ op_db: List[OpInfo] = [
             DecorateInfo(unittest.skip('Skipped!'), 'TestLazyOpInfo', 'test_dispatched_to_lazy'),
             DecorateInfo(unittest.expectedFailure, 'TestLazyOpInfo', 'test_correctness'),
             DecorateInfo(unittest.expectedFailure, 'TestLazyOpInfo', 'test_correctness_with_reusing_ir'),
+        ),
+    ),
+    OpInfo(
+        "_embedding_bag_dense_backward",
+        op=torch.ops.aten._embedding_bag_dense_backward.default,
+        aten_name="_embedding_bag_dense_backward",
+        dtypes=floating_types_and(torch.float16, torch.bfloat16),
+        dtypesIfCUDA=floating_types_and(torch.float16),
+        supports_out=False,
+        supports_autograd=False,
+        sample_inputs_func=sample_inputs_embedding_bag_dense_backward,
+        skips=(
+            # It might be OK to call contiguous() in the backward anyway, in
+            # case of direct use
+            DecorateInfo(unittest.skip('precondition for function is contiguity'), 'TestCommon', 'test_noncontiguous_samples'),
+            # NYI
+            DecorateInfo(unittest.expectedFailure, "TestVmapOperatorsOpInfo", "test_op_has_batch_rule"),
+            DecorateInfo(
+                toleranceOverride({torch.float16: tol(atol=5e-2, rtol=5e-2), }),
+                'TestInductorOpInfo', 'test_comprehensive'
+            ),
         ),
     ),
     OpInfo(
