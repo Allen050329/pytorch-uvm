@@ -2736,6 +2736,7 @@ class DeviceCachingAllocator {
       }
       return bool(p.block);
     } else {
+      p.err = cudaMallocMaybeCapturing(&ptr, size);
       if (p.err != cudaSuccess) {
         if (p.err == cudaErrorMemoryAllocation) {
           // If this is the first attempt (!isRetry), we can forgive and clear
@@ -3389,6 +3390,7 @@ class NativeCachingAllocator : public CUDAAllocator {
         const_cast<NativeCachingAllocator*>(this)->malloc(
             &devPtr, device, size, stream);
       }
+      return {devPtr, devPtr, &uncached_delete, Device(DeviceType::CUDA, device)};
     }
 
     if (size && TORCH_SDT_IS_ENABLED(malloc)) {
