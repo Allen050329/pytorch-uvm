@@ -2736,6 +2736,7 @@ class DeviceCachingAllocator {
       }
       return bool(p.block);
     } else {
+      p.err = cudaMallocMaybeCapturing(&ptr, size);
       if (p.err != cudaSuccess) {
         if (p.err == cudaErrorMemoryAllocation) {
           // If this is the first attempt (!isRetry), we can forgive and clear
