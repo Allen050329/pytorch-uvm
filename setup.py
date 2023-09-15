@@ -266,7 +266,7 @@ from tools.setup_helpers.env import build_type, IS_DARWIN, IS_LINUX, IS_WINDOWS
 ################################################################################
 
 VERBOSE_SCRIPT = True
-RUN_BUILD_DEPS = False
+RUN_BUILD_DEPS = True
 # see if the user passed a quiet flag to setup.py arguments and respect
 # that in our parts of the build
 EMIT_BUILD_WARNING = False
