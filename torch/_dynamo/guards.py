@@ -49,7 +49,7 @@ from torch.utils.weak import TensorWeakRef, WeakIdRef
 from . import config, convert_frame, mutation_guard
 from .eval_frame import set_guard_error_hook, set_guard_fail_hook
 from .exc import unimplemented
-from .source import LocalSource, TypeSource
+from .source import DefaultsSource, LocalSource, TypeSource
 from .types import GuardedCode, GuardFail, GuardFn  # noqa: F401
 from .utils import (
     dict_const_keys,
@@ -71,6 +71,7 @@ verbose_guards_log = torch._logging.getArtifactLogger(__name__, "verbose_guards"
 TensorGuards = torch._C._dynamo.guards.TensorGuards
 check_obj_id = torch._C._dynamo.guards.check_obj_id
 check_type_id = torch._C._dynamo.guards.check_type_id
+dict_version = torch._C._dynamo.guards.dict_version
 
 
 # For user stack printing
@@ -105,6 +106,7 @@ CLOSURE_VARS = collections.OrderedDict(
         ("___odict_getitem", collections.OrderedDict.__getitem__),
         ("___dict_param_key_ids", dict_param_key_ids),
         ("___dict_const_keys", dict_const_keys),
+        ("___dict_version", dict_version),
         ("___tuple_iterator_len", tuple_iterator_len),
         ("___tuple_iterator_getitem", tuple_iterator_getitem),
         ("__math_isnan", math.isnan),
@@ -180,7 +182,7 @@ class GuardCodeList:
 class GuardBuilder(GuardBuilderBase):
     def __init__(
         self,
-        id_ref: Callable[[Type[object]], str],
+        id_ref: Callable[[Any], str],
         source_ref: Callable[[Source], str],
         lookup_weakrefs: Callable[[Type[object]], ReferenceType[object]],
         user_scope: Optional[Dict[str, object]],
@@ -274,6 +276,13 @@ class GuardBuilder(GuardBuilderBase):
         t = type(self.get(guard.name))
         obj_id = self.id_ref(t)
         code = f"___check_type_id({self.arg_ref(guard)}, {obj_id})"
+        self._produce_guard_code(guard, [code])
+
+    def DICT_VERSION(self, guard: Guard):
+        # ___check_dict_version is same as `dict_version(x) == y`
+        ref = self.arg_ref(guard)
+        version = dict_version(self.get(guard.name))
+        code = f"___dict_version({ref}) == {version}"
         self._produce_guard_code(guard, [code])
 
     def BOOL_FALSE(self, guard: Guard):
@@ -438,27 +447,61 @@ class GuardBuilder(GuardBuilderBase):
             self.EQUALS_MATCH(guard)
 
     def NN_MODULE(self, guard: Guard):
+        # TODO(janimesh) - This id_match can be removed because nn_module_guard
+        # checks this in C. However, we need this redundant check to allow
+        # flexible cache size policy when we guard on self of nn module
+        # instances. See Note in torch/_dynamo/cache_size.py
         self.ID_MATCH(guard)
         ref = self.arg_ref(guard)
         val = self.get(guard.name)
 
-        def setup_guard():
-            assert istype(val.training, bool)
-            # TODO: Why doesn't this use produce_guard_code?
-            self.code.append(
-                GuardCodeList([f"{ref}.training == {val.training}"], guard)
-            )
-
-        if hasattr(val, "training"):
-            # There are cases where a monkeypatched object has a guard made between __new__ and __init__
-            setup_guard()
-        else:
+        # The module guard checks for modifications to the Module's type, __dict__,
+        # and various nested OrderedDicts, such as _parameters, _buffers, and _modules.
+        # This subsumes the check for Module.training.
+        if not hasattr(val, "training"):
             unimplemented(f"Guard setup for uninitialized class {type(val)}")
+        if config.allow_rnn and isinstance(
+            val, (torch.nn.RNN, torch.nn.GRU, torch.nn.LSTM)
+        ):
+            # TorchDynamo graph breaks on LSTMs, but this is a way if user wants
+            # to override it. LSTMs change the module state in every invocation,
+            # leading to recompilations.
+            log.warning("Skipping nn module guard on LSTMs")
+            return
+        try:
+            g = torch._C._dynamo.guards.nn_module_guard(val)
+        except AttributeError:
+            # We get an attribute error if the module is partially initialized. For example,
+            # we might be trying to install a guard before a super().__init__() call when
+            # the module is missing _parameters, _modules, and other attributes.
+            # For now, we skip installing the guard.
+            log.warning(
+                "Skipping nn module guard because the module could be partially initialized"
+            )
+            return
+        name = self.check_fn_manager.add_extra_closure_var("__nn_module_guard", g)
+        # debug_msg is only for debugging help and goes to kwargs of guard call,
+        # which is ignored.
+        self._produce_guard_code(guard, [f'{name}({ref}, debug_msg="{g}")'])
 
     def FUNCTION_MATCH(self, guard: Guard):
         """things like torch.add and user defined functions"""
         if guard.is_local():
             return self.ID_MATCH(guard)
+
+    def CLOSURE_MATCH(self, guard: Guard):
+        """matches a closure by __code__ id."""
+        if guard.is_local():
+            val = self.get(guard.name)
+            # Strictly only want user-defined functions
+            if type(val) == types.FunctionType and hasattr(val, "__code__"):
+                ref = self.arg_ref(guard)
+                code = [
+                    f"___check_obj_id(getattr({ref}, '__code__', None), {self.id_ref(val.__code__)})",
+                ]
+                self._produce_guard_code(guard, code)
+            else:
+                self.FUNCTION_MATCH(guard)
 
     def BUILTIN_MATCH(self, guard: Guard):
         return self.FUNCTION_MATCH(guard)
@@ -882,6 +925,20 @@ class PyExprCSEPass:
         return replacer.preface, _ast_unparse(new_node)
 
 
+def must_add_nn_module_guards(guard):
+    # For config.guard_nn_modules=False, we can skip all the guards that
+    # originate from inside of nn module except for a few categories.
+    return (
+        # Guard for defaults
+        isinstance(guard.originating_source, DefaultsSource)
+        # Guard using dict tags if the config flag is set
+        or (
+            config.guard_nn_modules_using_dict_tags
+            and guard.create_fn is GuardBuilder.NN_MODULE
+        )
+    )
+
+
 # NB: Naively, you'd expect this to only be a function that produces
 # the callable that constitutes the guard.  However, there is some
 # delicate handling for invalidating this check function when the
@@ -901,7 +958,9 @@ class CheckFunctionManager:
         guards = output_graph.guards if output_graph else None
         self.valid = True
         self._weakrefs: Dict[int, ReferenceType[object]] = {}
+        self._extra_closure_vars: Dict[str, object] = {}
         self.output_graph = output_graph
+        self.extra_closure_vars_count = 0
 
         # Note: right overrides left
         def combine_scopes(left, right):
@@ -951,13 +1010,10 @@ class CheckFunctionManager:
             if (
                 not config.guard_nn_modules
                 and guard.is_nn_module()
-                # Default func args must be guarded on.
-                # TODO: we could make use of 'DefaultsSource' and offer a .guard.is_defaults() API
-                and "__defaults__" not in guard.name
-                and "__kwdefaults__" not in guard.name
-                and (config.skip_nnmodule_hook_guards or "hooks" not in guard.name)
+                and not must_add_nn_module_guards(guard)
             ):
                 continue
+
             guard.create(local_builder, global_builder)
         self.check_fn = self.compile_check_fn(
             local_builder, global_builder, guards, guard_fail_fn
@@ -1022,15 +1078,19 @@ class CheckFunctionManager:
             if not log_only:
                 code_parts.append(code)
 
-        # TODO: Maybe better not to repeatedly spam the same guard information
-        # for each individual piece?  Not sure.
+        seen = set()
         for gcl in local_builder.code:
             for code in gcl.code_list:
-                add_code_part(code, gcl.guard)
+                if code not in seen:
+                    add_code_part(code, gcl.guard)
+                    seen.add(code)
 
+        seen = set()
         for gcl in global_builder.code:
             for code in gcl.code_list:
-                add_code_part(code, gcl.guard)
+                if code not in seen:
+                    add_code_part(code, gcl.guard)
+                    seen.add(code)
 
         tensor_check_names = (
             local_builder.tensor_check_names + global_builder.tensor_check_names
@@ -1146,6 +1206,7 @@ class CheckFunctionManager:
             + list(SYMPY_INTERP.items())
         )
         closure_vars.update(CLOSURE_VARS)
+        closure_vars.update(self._extra_closure_vars)
 
         unique_code_parts = list(unique(code_parts))
         make_guard_fn_args = ", ".join(closure_vars.keys())
@@ -1200,6 +1261,12 @@ class CheckFunctionManager:
         if id(obj) in self._weakrefs:
             return self._weakrefs[id(obj)]
         return None
+
+    def add_extra_closure_var(self, name_hint, obj):
+        name = f"{name_hint}_{self.extra_closure_vars_count}"
+        self.extra_closure_vars_count += 1
+        self._extra_closure_vars[name] = obj
+        return name
 
 
 def build_guard_function(code_parts, closure_args) -> Tuple[str, str]:

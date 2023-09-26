@@ -372,7 +372,9 @@ if(MKLDNN_FOUND)
   list(APPEND ATen_CPU_DEPENDENCY_LIBS ${MKLDNN_LIBRARIES})
 endif(MKLDNN_FOUND)
 
-list(APPEND ATen_CPU_DEPENDENCY_LIBS cpuinfo)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
+  list(APPEND ATen_CPU_DEPENDENCY_LIBS cpuinfo)
+endif()
 
 if(NOT MSVC AND NOT EMSCRIPTEN AND NOT INTERN_BUILD_MOBILE)
   # Preserve values for the main build
@@ -446,7 +448,6 @@ if(USE_CUDA AND NOT USE_ROCM)
     list(APPEND ATen_CUDA_DEPENDENCY_LIBS
       ${CUDA_LIBRARIES}
       CUDA::cusparse_static
-      CUDA::curand_static
       CUDA::cufft_static_nocallback
     )
    if(NOT BUILD_LAZY_CUDA_LINALG)
@@ -466,7 +467,6 @@ if(USE_CUDA AND NOT USE_ROCM)
     list(APPEND ATen_CUDA_DEPENDENCY_LIBS
       ${CUDA_LIBRARIES}
       CUDA::cusparse
-      CUDA::curand
       CUDA::cufft
     )
    if(NOT BUILD_LAZY_CUDA_LINALG)
